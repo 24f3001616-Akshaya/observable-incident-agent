@@ -409,10 +409,32 @@ def transition_to_effects(
 
     approval_required = set(policy.get("approvalRequiredFor", []))
     incident_info = internal.get("incident", {})
-    effect_args = {
-        "service": incident_info.get("service", "default"),
-        "rootCause": state["diagnosis"]["rootCause"]
-    }
+    catalog = internal.get("toolCatalog", [])
+    tool_def = next((t for t in catalog if t.get("name") == selected_tool), None)
+    props = tool_def.get("inputSchema", {}).get("properties", {}) if (tool_def and isinstance(tool_def.get("inputSchema"), dict)) else {}
+
+    effect_args = {}
+    for p_name, p_def in props.items():
+        if p_name in incident_info:
+            effect_args[p_name] = incident_info[p_name]
+        elif p_name == "service":
+            effect_args[p_name] = incident_info.get("service", "default")
+        elif p_name == "rootCause":
+            effect_args[p_name] = state["diagnosis"]["rootCause"]
+        elif p_name == "incidentId":
+            effect_args[p_name] = incident_info.get("incidentId", "")
+        elif isinstance(p_def, dict) and p_def.get("type") == "integer":
+            effect_args[p_name] = 1
+        elif isinstance(p_def, dict) and p_def.get("type") == "boolean":
+            effect_args[p_name] = True
+        else:
+            effect_args[p_name] = incident_info.get("service", "default")
+
+    if not effect_args:
+        effect_args = {
+            "service": incident_info.get("service", "default"),
+            "rootCause": state["diagnosis"]["rootCause"]
+        }
     action_id = "act_" + hex_id(8)
 
     if selected_tool in approval_required:
