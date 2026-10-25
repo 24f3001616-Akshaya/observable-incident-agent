@@ -3,9 +3,10 @@ from fastapi import HTTPException
 from canonical import hex_id, digest, canonical
 from telemetry import (
     build_empty_trace, create_span, make_traceparent,
-    append_trace_span, update_client_span_receipt
+    append_trace_span, update_client_span_receipt, create_join_span
 )
 from config import MODEL_NAME
+from planner import derive_case_arguments
 
 def initialize_incident_run(
     run_id: str,
@@ -18,6 +19,7 @@ def initialize_incident_run(
     marker = body.get("publicMarker", "")
     policy = body.get("policy", {})
     incident = body.get("incident", {})
+    catalog = body.get("toolCatalog", [])
     do_not_export = policy.get("doNotExport", [])
 
     # Trace ID: reuse incoming trace ID if present, else fresh 16-byte hex
@@ -99,9 +101,11 @@ def initialize_incident_run(
         tool_attrs = {
             **attrs_common,
             "ga5.action.id": action_id,
+            "ga5.call.id": call_id,
             "gen_ai.tool.name": tool_name,
             "gen_ai.tool.call.id": call_id,
-            "gen_ai.operation.name": "execute_tool"
+            "gen_ai.operation.name": "execute_tool",
+            "ga5.attempt": 1
         }
         tool_span = create_span(
             trace_id=trace_id,
@@ -118,6 +122,9 @@ def initialize_incident_run(
         client_attrs = {
             **attrs_common,
             "ga5.action.id": action_id,
+            "ga5.call.id": call_id,
+            "gen_ai.tool.name": tool_name,
+            "gen_ai.tool.call.id": call_id,
             "ga5.attempt": 1,
             "http.request.method": "POST",
             "http.request.resend_count": 0
@@ -149,11 +156,8 @@ def initialize_incident_run(
         "_internal": {
             "requestHash": req_hash,
             "policy": policy,
-            "incident": {
-                "incidentId": incident.get("incidentId"),
-                "service": incident.get("service"),
-                "severity": incident.get("severity")
-            },
+            "incident": incident,
+            "toolCatalog": catalog,
             "recommendedEffect": plan.get("recommendedEffect"),
             "traceId": trace_id,
             "serverSpanId": server_span_id,
@@ -178,10 +182,31 @@ def process_receipts_state_machine(state: Dict[str, Any], body: Dict[str, Any]) 
     action_tool_spans = internal.get("actionToolSpans", {})
     do_not_export = policy.get("doNotExport", [])
 
+    # 1. Add SERVER span for incoming POST /v2/incidents/{runId}/receipts request
+    receipt_server_span_id = hex_id(8)
+    receipt_server_attrs = {
+        "ga5.run.id": state["runId"],
+        "ga5.public.marker": marker,
+        "ga5.receipt.id": receipt_id,
+        "http.request.method": "POST",
+        "http.route": "/v2/incidents/{runId}/receipts"
+    }
+    receipt_server_span = create_span(
+        trace_id=trace_id,
+        span_id=receipt_server_span_id,
+        parent_id=server_span_id,
+        name="POST /v2/incidents/{runId}/receipts",
+        kind=2,
+        attrs=receipt_server_attrs,
+        links=[{"traceId": trace_id, "spanId": server_span_id}],
+        do_not_export=do_not_export
+    )
+    append_trace_span(state["otlp"], receipt_server_span)
+
     pending_dispatches = {d["actionId"]: d for d in state.get("dispatches", [])}
     pending_approvals = {a["actionId"]: a for a in state.get("approvals", [])}
 
-    # 1. Process Outcomes
+    # 2. Process Outcomes
     for outcome in outcomes:
         action_id = outcome.get("actionId")
         if action_id not in pending_dispatches:
@@ -194,8 +219,10 @@ def process_receipts_state_machine(state: Dict[str, Any], body: Dict[str, Any]) 
         status_val = outcome.get("status")
         result_class = outcome.get("resultClass", "")
         attempt = outcome.get("attempt", 1)
+        nonce = outcome.get("nonce")
+        real_result = outcome.get("result", result_class)
 
-        # Authoritative receipt logging (excluding raw arguments or secrets)
+        # Authoritative receipt logging
         receipt_entry = {
             "receiptId": receipt_id,
             "actionId": action_id,
@@ -203,28 +230,39 @@ def process_receipts_state_machine(state: Dict[str, Any], body: Dict[str, Any]) 
             "attempt": attempt,
             "status": status_val,
             "resultClass": result_class,
-            "nonce": outcome.get("nonce")
+            "nonce": nonce
         }
         state["receiptLog"].append(receipt_entry)
 
-        # Correlate in OTLP trace
+        # Update actionLog entry with reported real result
+        for a_log in state.get("actionLog", []):
+            if a_log.get("actionId") == action_id and a_log.get("attempt") == attempt:
+                a_log["status"] = status_val
+                a_log["resultClass"] = result_class
+                if nonce:
+                    a_log["nonce"] = nonce
+                if real_result is not None:
+                    a_log["result"] = real_result
+
+        # Correlate across spans in OTLP trace
         update_client_span_receipt(
             state["otlp"],
             action_id=action_id,
+            call_id=outcome["callId"],
             attempt=attempt,
             receipt_id=receipt_id,
             status_val=status_val,
             result_class=result_class,
-            nonce=outcome.get("nonce")
+            nonce=nonce,
+            result=real_result
         )
 
         # Check for 503 Retry Requirement:
-        # A 503 response must trigger exactly one retry when required by specification.
-        # Stable logical IDs (same actionId, same callId) and a new CLIENT span ID.
+        # A 503 response must trigger exactly one retry with stable actionId/callId and new client span.
         is_503 = (str(status_val) == "503") or (result_class in ("503", "transient_error"))
         if is_503:
             if attempt == 1:
-                # Trigger retry with attempt = 2
+                # Trigger retry attempt 2
                 new_client_span_id = hex_id(8)
                 tool_span_id = action_tool_spans.get(action_id, server_span_id)
                 new_traceparent = make_traceparent(trace_id, new_client_span_id)
@@ -235,11 +273,14 @@ def process_receipts_state_machine(state: Dict[str, Any], body: Dict[str, Any]) 
                 # Log retry dispatch in actionLog
                 state["actionLog"].append(dict(dispatch))
 
-                # Add new CLIENT span to trace
+                # Add new CLIENT span to trace for retry
                 retry_attrs = {
                     "ga5.run.id": state["runId"],
                     "ga5.public.marker": marker,
                     "ga5.action.id": action_id,
+                    "ga5.call.id": dispatch["callId"],
+                    "gen_ai.tool.name": dispatch["toolName"],
+                    "gen_ai.tool.call.id": dispatch["callId"],
                     "ga5.attempt": 2,
                     "http.request.method": "POST",
                     "http.request.resend_count": 1
@@ -260,6 +301,11 @@ def process_receipts_state_machine(state: Dict[str, Any], body: Dict[str, Any]) 
                 # Attempt 2 failed: terminates retry limit
                 state["status"] = "failed"
                 state["dispatches"] = []
+                # Final join span
+                append_trace_span(
+                    state["otlp"],
+                    create_join_span(trace_id, server_span_id, state["runId"], marker, "failed", do_not_export)
+                )
                 continue
 
         # Check for Timeout Suppression Requirement:
@@ -274,6 +320,10 @@ def process_receipts_state_machine(state: Dict[str, Any], body: Dict[str, Any]) 
                 })
             state["status"] = "failed"
             state["dispatches"] = []
+            append_trace_span(
+                state["otlp"],
+                create_join_span(trace_id, server_span_id, state["runId"], marker, "failed", do_not_export)
+            )
             continue
 
         # Check for non-retryable failure
@@ -281,25 +331,32 @@ def process_receipts_state_machine(state: Dict[str, Any], body: Dict[str, Any]) 
         if is_failure:
             state["status"] = "failed"
             state["dispatches"] = []
+            append_trace_span(
+                state["otlp"],
+                create_join_span(trace_id, server_span_id, state["runId"], marker, "failed", do_not_export)
+            )
             continue
 
         # Successful outcome handling
         if dispatch.get("phase") == "diagnostic":
-            # Record completed diagnostic
             internal.setdefault("completedDiagnostics", []).append(action_id)
-            # Remove this completed dispatch
             state["dispatches"] = [d for d in state["dispatches"] if d["actionId"] != action_id]
 
-            # If all diagnostics have finished successfully, transition to Effect phase!
+            # If all diagnostics have succeeded, transition to Effect phase
             if not state["dispatches"]:
-                transition_to_effects(state, internal, trace_id, server_span_id, marker, policy, do_not_export)
+                transition_to_effects(state, internal, trace_id, receipt_server_span_id, marker, policy, do_not_export)
 
         elif dispatch.get("phase") == "effect":
             # Effect action succeeded -> incident resolved!
             state["status"] = "resolved"
             state["dispatches"] = [d for d in state["dispatches"] if d["actionId"] != action_id]
+            # Final join span linking back to root
+            append_trace_span(
+                state["otlp"],
+                create_join_span(trace_id, server_span_id, state["runId"], marker, "resolved", do_not_export)
+            )
 
-    # 2. Process Approvals
+    # 3. Process Approvals
     for apprv in approvals:
         action_id = apprv.get("actionId")
         if action_id not in pending_approvals:
@@ -335,15 +392,18 @@ def process_receipts_state_machine(state: Dict[str, Any], body: Dict[str, Any]) 
             tool_attrs = {
                 **attrs_common,
                 "ga5.action.id": action_id,
+                "ga5.call.id": call_id,
                 "gen_ai.tool.name": effect_tool,
                 "gen_ai.tool.call.id": call_id,
                 "gen_ai.operation.name": "execute_tool",
-                "ga5.approval.status": "approved"
+                "ga5.approval.status": "approved",
+                "ga5.approval.digest": pending_entry.get("digest", ""),
+                "ga5.attempt": 1
             }
             tool_span = create_span(
                 trace_id=trace_id,
                 span_id=tool_span_id,
-                parent_id=server_span_id,
+                parent_id=receipt_server_span_id,
                 name=f"execute_tool {effect_tool}",
                 kind=1,
                 attrs=tool_attrs,
@@ -354,6 +414,9 @@ def process_receipts_state_machine(state: Dict[str, Any], body: Dict[str, Any]) 
             client_attrs = {
                 **attrs_common,
                 "ga5.action.id": action_id,
+                "ga5.call.id": call_id,
+                "gen_ai.tool.name": effect_tool,
+                "gen_ai.tool.call.id": call_id,
                 "ga5.attempt": 1,
                 "http.request.method": "POST",
                 "http.request.resend_count": 0
@@ -378,6 +441,10 @@ def process_receipts_state_machine(state: Dict[str, Any], body: Dict[str, Any]) 
             state["approvals"] = [a for a in state["approvals"] if a["actionId"] != action_id]
             state["status"] = "failed"
             state["dispatches"] = []
+            append_trace_span(
+                state["otlp"],
+                create_join_span(trace_id, server_span_id, state["runId"], marker, "failed", do_not_export)
+            )
 
     return state
 
@@ -385,19 +452,24 @@ def transition_to_effects(
     state: Dict[str, Any],
     internal: Dict[str, Any],
     trace_id: str,
-    server_span_id: str,
+    parent_span_id: str,
     marker: str,
     policy: Dict[str, Any],
     do_not_export: List[str]
 ):
     """Select exactly one justified effect tool after successful diagnostics."""
     effect_tools = policy.get("effectTools", [])
+    server_span_id = internal.get("serverSpanId", parent_span_id)
     if not effect_tools:
         # No effects configured, incident considered resolved
         state["status"] = "resolved"
+        append_trace_span(
+            state["otlp"],
+            create_join_span(trace_id, server_span_id, state["runId"], marker, "resolved", do_not_export)
+        )
         return
 
-    # Select effect: prioritized recommended effect or first available effect tool
+    # Select effect tool: prioritized scaling limit page_owner or recommended effect
     rec_effect = internal.get("recommendedEffect")
     transcript_text = str(internal.get("incident", {}).get("transcript", "")).lower()
     if ("scaling limit" in transcript_text or "permitted scaling limit" in transcript_text) and any("page" in t or "notify" in t for t in effect_tools):
@@ -411,30 +483,9 @@ def transition_to_effects(
     incident_info = internal.get("incident", {})
     catalog = internal.get("toolCatalog", [])
     tool_def = next((t for t in catalog if t.get("name") == selected_tool), None)
-    props = tool_def.get("inputSchema", {}).get("properties", {}) if (tool_def and isinstance(tool_def.get("inputSchema"), dict)) else {}
+    tool_schema = tool_def.get("inputSchema", {}) if tool_def else {}
 
-    effect_args = {}
-    for p_name, p_def in props.items():
-        if p_name in incident_info:
-            effect_args[p_name] = incident_info[p_name]
-        elif p_name == "service":
-            effect_args[p_name] = incident_info.get("service", "default")
-        elif p_name == "rootCause":
-            effect_args[p_name] = state["diagnosis"]["rootCause"]
-        elif p_name == "incidentId":
-            effect_args[p_name] = incident_info.get("incidentId", "")
-        elif isinstance(p_def, dict) and p_def.get("type") == "integer":
-            effect_args[p_name] = 1
-        elif isinstance(p_def, dict) and p_def.get("type") == "boolean":
-            effect_args[p_name] = True
-        else:
-            effect_args[p_name] = incident_info.get("service", "default")
-
-    if not effect_args:
-        effect_args = {
-            "service": incident_info.get("service", "default"),
-            "rootCause": state["diagnosis"]["rootCause"]
-        }
+    effect_args = derive_case_arguments(tool_schema, incident_info, state["diagnosis"]["rootCause"])
     action_id = "act_" + hex_id(8)
 
     if selected_tool in approval_required:
@@ -469,7 +520,7 @@ def transition_to_effects(
         apprv_span = create_span(
             trace_id=trace_id,
             span_id=hex_id(8),
-            parent_id=server_span_id,
+            parent_id=parent_span_id,
             name=f"request_approval {selected_tool}",
             kind=1,
             attrs=apprv_attrs,
@@ -500,14 +551,16 @@ def transition_to_effects(
         tool_attrs = {
             **attrs_common,
             "ga5.action.id": action_id,
+            "ga5.call.id": call_id,
             "gen_ai.tool.name": selected_tool,
             "gen_ai.tool.call.id": call_id,
-            "gen_ai.operation.name": "execute_tool"
+            "gen_ai.operation.name": "execute_tool",
+            "ga5.attempt": 1
         }
         tool_span = create_span(
             trace_id=trace_id,
             span_id=tool_span_id,
-            parent_id=server_span_id,
+            parent_id=parent_span_id,
             name=f"execute_tool {selected_tool}",
             kind=1,
             attrs=tool_attrs,
@@ -518,6 +571,9 @@ def transition_to_effects(
         client_attrs = {
             **attrs_common,
             "ga5.action.id": action_id,
+            "ga5.call.id": call_id,
+            "gen_ai.tool.name": selected_tool,
+            "gen_ai.tool.call.id": call_id,
             "ga5.attempt": 1,
             "http.request.method": "POST",
             "http.request.resend_count": 0

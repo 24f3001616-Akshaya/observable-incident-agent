@@ -113,48 +113,73 @@ def append_trace_span(trace: Dict[str, Any], span: Dict[str, Any]):
     spans.append(span)
     set_trace_spans(trace, spans)
 
-def find_span_by_attr(trace: Dict[str, Any], attr_key: str, attr_val: str) -> Optional[Dict[str, Any]]:
-    for s in get_trace_spans(trace):
-        for a in s.get("attributes", []):
-            if a.get("key") == attr_key and a.get("value", {}).get("stringValue") == str(attr_val):
-                return s
-    return None
-
 def update_client_span_receipt(
     trace: Dict[str, Any],
     action_id: str,
+    call_id: str,
     attempt: int,
     receipt_id: str,
     status_val: Any,
     result_class: Optional[str] = None,
-    nonce: Optional[str] = None
+    nonce: Optional[str] = None,
+    result: Optional[Any] = None
 ):
-    """Correlate receipt outcome with the corresponding client span in the trace."""
-    target_span = None
+    """Correlate receipt outcome across corresponding client and tool spans."""
     for s in get_trace_spans(trace):
         attrs = {a.get("key"): a.get("value", {}).get("stringValue") for a in s.get("attributes", [])}
-        if attrs.get("ga5.action.id") == action_id and str(attrs.get("ga5.attempt")) == str(attempt) and s.get("kind") == 3:
-            target_span = s
-            break
-    
-    if not target_span:
-        return
+        if attrs.get("ga5.action.id") == action_id:
+            # Match either the client span for this attempt or the tool execution span
+            is_client = (s.get("kind") == 3 and str(attrs.get("ga5.attempt")) == str(attempt))
+            is_tool = (s.get("kind") == 1 and attrs.get("gen_ai.operation.name") == "execute_tool")
+            
+            if is_client or is_tool:
+                new_attrs = dict(attrs)
+                new_attrs["ga5.call.id"] = call_id
+                new_attrs["gen_ai.tool.call.id"] = call_id
+                new_attrs["ga5.receipt.id"] = receipt_id
+                if status_val is not None:
+                    new_attrs["ga5.receipt.status"] = str(status_val)
+                if result_class:
+                    new_attrs["ga5.result_class"] = str(result_class)
+                    new_attrs["ga5.receipt.result_class"] = str(result_class)
+                if nonce:
+                    new_attrs["ga5.receipt.nonce"] = str(nonce)
+                if result is not None:
+                    new_attrs["ga5.receipt.result"] = str(result)
+                
+                s["attributes"] = sanitize_attributes(new_attrs)
+                s["endTimeUnixNano"] = now_unix_nano()
+                
+                if str(status_val) in ("503", "500", "408") or result_class in ("server_error", "transient_error", "timeout", "failed"):
+                    s["status"] = {"code": 2, "message": f"{result_class or 'error'} status {status_val}"}
+                else:
+                    s["status"] = {"code": 1}
 
-    # Update or add attributes
-    new_attrs = {a.get("key"): a.get("value", {}).get("stringValue") for a in target_span.get("attributes", [])}
-    new_attrs["ga5.receipt.id"] = receipt_id
-    if status_val is not None:
-        new_attrs["ga5.receipt.status"] = str(status_val)
-    if result_class:
-        new_attrs["ga5.result_class"] = str(result_class)
-    if nonce:
-        new_attrs["ga5.receipt.nonce"] = str(nonce)
-    
-    target_span["attributes"] = sanitize_attributes(new_attrs)
-    target_span["endTimeUnixNano"] = now_unix_nano()
-
-    # Set span status code: 1 = OK, 2 = ERROR
-    if str(status_val) in ("503", "500", "408") or result_class in ("server_error", "transient_error", "timeout", "failed"):
-        target_span["status"] = {"code": 2, "message": f"{result_class or 'error'} status {status_val}"}
-    else:
-        target_span["status"] = {"code": 1}
+def create_join_span(
+    trace_id: str,
+    server_span_id: str,
+    run_id: str,
+    marker: str,
+    final_status: str,
+    do_not_export: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Create final join span linking back to root server span upon run completion."""
+    join_span_id = hex_id(8)
+    join_attrs = {
+        "ga5.run.id": run_id,
+        "ga5.public.marker": marker,
+        "ga5.status": final_status,
+        "operation.name": "join"
+    }
+    join_links = [{"traceId": trace_id, "spanId": server_span_id}]
+    return create_span(
+        trace_id=trace_id,
+        span_id=join_span_id,
+        parent_id=server_span_id,
+        name="join",
+        kind=1,
+        attrs=join_attrs,
+        links=join_links,
+        status={"code": 1 if final_status == "resolved" else 2},
+        do_not_export=do_not_export
+    )
