@@ -20,8 +20,7 @@ def init_db(path: Optional[str] = None):
                 run_id TEXT PRIMARY KEY,
                 request_hash TEXT NOT NULL,
                 state_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                created_at TEXT NOT NULL
             )
         """)
         conn.execute("""
@@ -30,7 +29,6 @@ def init_db(path: Optional[str] = None):
                 receipt_id TEXT NOT NULL,
                 request_hash TEXT NOT NULL,
                 response_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
                 PRIMARY KEY (run_id, receipt_id)
             )
         """)
@@ -51,17 +49,16 @@ def save_run(run_id: str, request_hash: str, state: Dict[str, Any], path: Option
     timestamp = now_iso()
     with get_connection(path) as conn:
         conn.execute(
-            "INSERT INTO runs(run_id, request_hash, state_json, created_at, updated_at) VALUES(?, ?, ?, ?, ?)",
-            (run_id, request_hash, canonical(state), timestamp, timestamp)
+            "INSERT INTO runs(run_id, request_hash, state_json, created_at) VALUES(?, ?, ?, ?)",
+            (run_id, request_hash, canonical(state), timestamp)
         )
 
 def update_run(run_id: str, state: Dict[str, Any], path: Optional[str] = None):
     """Updates an existing run record state."""
-    timestamp = now_iso()
     with get_connection(path) as conn:
         conn.execute(
-            "UPDATE runs SET state_json=?, updated_at=? WHERE run_id=?",
-            (canonical(state), timestamp, run_id)
+            "UPDATE runs SET state_json=? WHERE run_id=?",
+            (canonical(state), run_id)
         )
 
 def get_receipt(run_id: str, receipt_id: str, path: Optional[str] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -77,9 +74,8 @@ def get_receipt(run_id: str, receipt_id: str, path: Optional[str] = None) -> Opt
 
 def save_receipt(run_id: str, receipt_id: str, request_hash: str, response: Dict[str, Any], path: Optional[str] = None):
     """Saves a receipt record."""
-    timestamp = now_iso()
     with get_connection(path) as conn:
         conn.execute(
-            "INSERT INTO receipts(run_id, receipt_id, request_hash, response_json, created_at) VALUES(?, ?, ?, ?, ?)",
-            (run_id, receipt_id, request_hash, canonical(response), timestamp)
+            "INSERT INTO receipts(run_id, receipt_id, request_hash, response_json) VALUES(?, ?, ?, ?)",
+            (run_id, receipt_id, request_hash, canonical(response))
         )
