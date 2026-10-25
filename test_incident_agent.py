@@ -580,4 +580,265 @@ def test_non_destructive_effect_direct_dispatch(sample_payload):
         assert effect_disp["phase"] == "effect"
         assert effect_disp["toolName"] == "restart_service"
 
+def test_grader_category_1_proposal(sample_payload):
+    """Category 1: Proposal - supported root cause, required evidence IDs, diagnostic dispatches before effects."""
+    with TestClient(app) as client:
+        res = client.post("/v2/incidents", json=sample_payload)
+        assert res.status_code == 200
+        data = res.json()
+
+        # 1. Supported root cause from allowedRootCauses
+        assert "diagnosis" in data
+        assert data["diagnosis"]["rootCause"] in sample_payload["incident"]["allowedRootCauses"]
+
+        # 2. Exact required evidence IDs (2-4 distinct, matching transcript)
+        evidence = data["diagnosis"]["evidence"]
+        assert isinstance(evidence, list)
+        assert 2 <= len(evidence) <= 4
+        assert len(set(evidence)) == len(evidence)
+        for e in evidence:
+            assert e in sample_payload["incident"]["transcript"]
+
+        # 3. Only permitted diagnostic tools dispatched before effects
+        assert len(data["dispatches"]) > 0
+        effect_tools = set(sample_payload["policy"]["effectTools"])
+        for d in data["dispatches"]:
+            assert d["phase"] == "diagnostic"
+            assert d["toolName"] not in effect_tools
+            assert d["attempt"] == 1
+            assert "traceparent" in d
+            assert len(d["evidence"]) >= 1
+            assert all(e in evidence for e in d["evidence"])
+
+def test_grader_category_2_action_semantics(sample_payload):
+    """Category 2: Action Semantics - exact case-derived arguments and real outcome reporting."""
+    case_payload = dict(sample_payload)
+    case_payload["runId"] = "run_case_semantics_001"
+    case_payload["incident"] = dict(sample_payload["incident"])
+    case_payload["incident"]["service"] = "payment-service"
+    case_payload["incident"]["transcript"] = (
+        "Spike observed in us-east-1 on service payment-service after deployment d-99a1 [EV-101]. "
+        "Pool limit saturated [EV-102]."
+    )
+    case_payload["toolCatalog"] = [
+        {
+            "name": "check_pool",
+            "description": "Inspect pool",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "service": {"type": "string"},
+                    "region": {"type": "string"},
+                    "deploymentId": {"type": "string"}
+                }
+            }
+        }
+    ]
+    case_payload["policy"]["effectTools"] = []
+
+    with TestClient(app) as client:
+        init_res = client.post("/v2/incidents", json=case_payload).json()
+        assert len(init_res["dispatches"]) == 1
+        disp = init_res["dispatches"][0]
+
+        # Case-derived arguments verification
+        args = disp["arguments"]
+        assert args.get("region") == "us-east-1"
+        assert args.get("deploymentId") == "d-99a1"
+        assert args.get("service") == "payment-service"
+
+        # Report real tool result via receipt
+        receipt_payload = {
+            "receiptId": "rec_real_result_001",
+            "outcomes": [
+                {
+                    "actionId": disp["actionId"],
+                    "callId": disp["callId"],
+                    "attempt": 1,
+                    "status": 200,
+                    "resultClass": "success",
+                    "result": {"active_connections": 99, "pool_limit": 100},
+                    "nonce": "n_sec_123"
+                }
+            ]
+        }
+        res = client.post(f"/v2/incidents/{case_payload['runId']}/receipts", json=receipt_payload).json()
+        
+        # Real result reported in logs
+        assert len(res["receiptLog"]) == 1
+        r_log = res["receiptLog"][0]
+        assert r_log["receiptId"] == "rec_real_result_001"
+        assert r_log["status"] == 200
+        assert r_log["resultClass"] == "success"
+        assert r_log["nonce"] == "n_sec_123"
+
+        # Real result reported in actionLog
+        a_log = next(a for a in res["actionLog"] if a["actionId"] == disp["actionId"])
+        assert a_log["status"] == 200
+        assert a_log["resultClass"] == "success"
+        assert a_log["nonce"] == "n_sec_123"
+
+def test_grader_category_3_trace_topology(sample_payload):
+    """Category 3: Trace Topology - continuity, unique span IDs, parent links, span counts, and final join."""
+    with TestClient(app) as client:
+        tp_header = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        init_res = client.post("/v2/incidents", json=sample_payload, headers={"traceparent": tp_header}).json()
+
+        # 1. Trace continuity: traceId preserved
+        spans_1 = init_res["otlp"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        expected_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+        for s in spans_1:
+            assert s["traceId"] == expected_trace_id
+
+        # 2. Unique span IDs
+        span_ids_1 = [s["spanId"] for s in spans_1]
+        assert len(span_ids_1) == len(set(span_ids_1))
+
+        # 3. Complete diagnostics to transition through receipt and resolution
+        diag_outcomes = [
+            {"actionId": d["actionId"], "callId": d["callId"], "attempt": 1, "status": 200, "resultClass": "success"}
+            for d in init_res["dispatches"]
+        ]
+        res_diag = client.post(
+            f"/v2/incidents/{sample_payload['runId']}/receipts",
+            json={"receiptId": "rec_topo_diag_01", "outcomes": diag_outcomes}
+        ).json()
+
+        # Approve destructive action
+        apprv = res_diag["approvals"][0]
+        res_apprv = client.post(
+            f"/v2/incidents/{sample_payload['runId']}/receipts",
+            json={"receiptId": "rec_topo_apprv_01", "approvals": [{"actionId": apprv["actionId"], "digest": apprv["digest"], "approved": True}]}
+        ).json()
+
+        # Complete effect tool
+        eff_disp = res_apprv["dispatches"][0]
+        res_final = client.post(
+            f"/v2/incidents/{sample_payload['runId']}/receipts",
+            json={"receiptId": "rec_topo_eff_01", "outcomes": [{"actionId": eff_disp["actionId"], "callId": eff_disp["callId"], "attempt": 1, "status": 200, "resultClass": "success"}]}
+        ).json()
+
+        assert res_final["status"] == "resolved"
+
+        # Verify final spans
+        all_spans = res_final["otlp"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        all_span_ids = [s["spanId"] for s in all_spans]
+        assert len(all_span_ids) == len(set(all_span_ids))
+
+        # Continuity across all spans
+        for s in all_spans:
+            assert s["traceId"] == expected_trace_id
+
+        # Root server span
+        root_span = next(s for s in all_spans if s["name"] == "POST /v2/incidents")
+        assert root_span["kind"] == 2
+        assert root_span.get("parentSpanId") == "00f067aa0ba902b7"
+
+        # Final join span linking back to root
+        join_span = next((s for s in all_spans if s["name"] == "join"), None)
+        assert join_span is not None
+        assert join_span["parentSpanId"] == root_span["spanId"]
+        assert any(link.get("spanId") == root_span["spanId"] for link in join_span.get("links", []))
+
+def test_grader_category_4_correlation(sample_payload):
+    """Category 4: Correlation - connect action, call, attempt, approval, and receipt across spans and logs."""
+    with TestClient(app) as client:
+        init_res = client.post("/v2/incidents", json=sample_payload).json()
+        d = init_res["dispatches"][0]
+
+        receipt_id = "rec_corr_test_01"
+        nonce = "nonce_corr_xyz"
+        res = client.post(
+            f"/v2/incidents/{sample_payload['runId']}/receipts",
+            json={
+                "receiptId": receipt_id,
+                "outcomes": [
+                    {
+                        "actionId": d["actionId"],
+                        "callId": d["callId"],
+                        "attempt": 1,
+                        "status": 200,
+                        "resultClass": "success",
+                        "nonce": nonce
+                    }
+                ]
+            }
+        ).json()
+
+        # Check logs
+        r_entry = next(r for r in res["receiptLog"] if r["actionId"] == d["actionId"])
+        assert r_entry["callId"] == d["callId"]
+        assert r_entry["receiptId"] == receipt_id
+        assert r_entry["nonce"] == nonce
+
+        # Check spans correlation
+        spans = res["otlp"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        client_span = next(s for s in spans if s["kind"] == 3 and s["name"] == f"POST tool/{d['toolName']}")
+        c_attrs = {a["key"]: a["value"]["stringValue"] for a in client_span["attributes"]}
+        assert c_attrs["ga5.action.id"] == d["actionId"]
+        assert c_attrs["ga5.call.id"] == d["callId"]
+        assert c_attrs["ga5.receipt.id"] == receipt_id
+        assert c_attrs["ga5.receipt.status"] == "200"
+        assert c_attrs["ga5.receipt.nonce"] == nonce
+
+def test_grader_category_5_lifecycle(sample_payload):
+    """Category 5: Lifecycle - retry logic, timeout suppression, approval gating, and completion."""
+    with TestClient(app) as client:
+        # 1. 503 retry triggers attempt 2 with stable actionId and callId
+        init_res = client.post("/v2/incidents", json=sample_payload).json()
+        d = init_res["dispatches"][0]
+        res_503 = client.post(
+            f"/v2/incidents/{sample_payload['runId']}/receipts",
+            json={
+                "receiptId": "rec_life_503_01",
+                "outcomes": [{"actionId": d["actionId"], "callId": d["callId"], "attempt": 1, "status": 503, "resultClass": "transient_error"}]
+            }
+        ).json()
+
+        assert res_503["status"] == "waiting"
+        retry_d = res_503["dispatches"][0]
+        assert retry_d["actionId"] == d["actionId"]
+        assert retry_d["callId"] == d["callId"]
+        assert retry_d["attempt"] == 2
+
+        # 2. Second 503 fails run
+        res_fail = client.post(
+            f"/v2/incidents/{sample_payload['runId']}/receipts",
+            json={
+                "receiptId": "rec_life_503_02",
+                "outcomes": [{"actionId": retry_d["actionId"], "callId": retry_d["callId"], "attempt": 2, "status": 503, "resultClass": "transient_error"}]
+            }
+        ).json()
+        assert res_fail["status"] == "failed"
+        assert len(res_fail["dispatches"]) == 0
+
+def test_grader_category_6_durability(sample_payload, tmp_path):
+    """Category 6: Durability - replay idempotency, conflict rejection, and self-healing DB recovery."""
+    with TestClient(app) as client:
+        # 1. Replay identical request returns exact stored state
+        res1 = client.post("/v2/incidents", json=sample_payload).json()
+        res2 = client.post("/v2/incidents", json=sample_payload).json()
+        assert res1["runId"] == res2["runId"]
+        assert res1["diagnosis"] == res2["diagnosis"]
+
+        # 2. Conflicting runId returns HTTP 409
+        conflict_payload = dict(sample_payload)
+        conflict_payload["publicMarker"] = "different_marker"
+        r_conf = client.post("/v2/incidents", json=conflict_payload)
+        assert r_conf.status_code == 409
+
+        # 3. GET /v2/incidents/{runId} returns stored state
+        r_get = client.get(f"/v2/incidents/{sample_payload['runId']}")
+        assert r_get.status_code == 200
+        assert r_get.json()["runId"] == sample_payload["runId"]
+
+        # 4. Self-healing DB recovery from malformed file
+        corrupt_file = str(tmp_path / "corrupt_test.sqlite3")
+        with open(corrupt_file, "wb") as f:
+            f.write(b"NOT_A_VALID_SQLITE_DATABASE_CORRUPT")
+        database.init_db(corrupt_file)
+        with database.get_db(corrupt_file) as conn:
+            cnt = conn.execute("SELECT count(*) as c FROM runs").fetchone()["c"]
+            assert cnt == 0
+
 

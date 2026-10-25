@@ -148,9 +148,13 @@ async def post_receipts(run_id: str, request: Request):
         # Replaying identical receipt returns identical stored response
         return JSONResponse(content=sanitize_public_state(prior_response))
 
+    # Incoming trace context continuation if passed on receipt request
+    tp_header = request.headers.get("traceparent")
+    incoming_trace_info = parse_traceparent(tp_header)
+
     # Load latest state and apply state machine transitions
     _, current_state = existing
-    updated_state = process_receipts_state_machine(current_state, body)
+    updated_state = process_receipts_state_machine(current_state, body, incoming_trace_info=incoming_trace_info)
 
     # Persist updated run state and receipt record
     update_run(run_id, updated_state)

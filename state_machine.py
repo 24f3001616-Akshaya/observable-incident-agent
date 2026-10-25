@@ -168,7 +168,11 @@ def initialize_incident_run(
     }
     return initial_state
 
-def process_receipts_state_machine(state: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+def process_receipts_state_machine(
+    state: Dict[str, Any],
+    body: Dict[str, Any],
+    incoming_trace_info: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
     """Execute state machine transitions upon receiving authoritative receipts or approvals."""
     receipt_id = body.get("receiptId")
     outcomes = body.get("outcomes", [])
@@ -191,6 +195,13 @@ def process_receipts_state_machine(state: Dict[str, Any], body: Dict[str, Any]) 
         "http.request.method": "POST",
         "http.route": "/v2/incidents/{runId}/receipts"
     }
+    receipt_links = [{"traceId": trace_id, "spanId": server_span_id}]
+    if incoming_trace_info and incoming_trace_info.get("parentSpanId"):
+        receipt_links.append({
+            "traceId": incoming_trace_info.get("traceId", trace_id),
+            "spanId": incoming_trace_info["parentSpanId"]
+        })
+
     receipt_server_span = create_span(
         trace_id=trace_id,
         span_id=receipt_server_span_id,
@@ -198,7 +209,7 @@ def process_receipts_state_machine(state: Dict[str, Any], body: Dict[str, Any]) 
         name="POST /v2/incidents/{runId}/receipts",
         kind=2,
         attrs=receipt_server_attrs,
-        links=[{"traceId": trace_id, "spanId": server_span_id}],
+        links=receipt_links,
         do_not_export=do_not_export
     )
     append_trace_span(state["otlp"], receipt_server_span)
