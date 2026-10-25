@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import json
 from contextlib import contextmanager
@@ -5,14 +6,36 @@ from typing import Optional, Tuple, Dict, Any, Generator
 from config import DB_PATH
 from canonical import canonical, now_iso
 
+def _connect_and_setup(target_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(target_path, timeout=30.0)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=15000;")
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
 @contextmanager
 def get_db(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, None]:
     target_path = path or DB_PATH
-    conn = sqlite3.connect(target_path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout=15000;")
+    try:
+        conn = _connect_and_setup(target_path)
+    except sqlite3.DatabaseError:
+        # Self-healing: if an existing sqlite file from git clone is malformed, recreate cleanly
+        try:
+            if os.path.exists(target_path):
+                os.remove(target_path)
+            for ext in ("-shm", "-wal"):
+                sidecar = target_path + ext
+                if os.path.exists(sidecar):
+                    os.remove(sidecar)
+        except Exception:
+            pass
+        conn = _connect_and_setup(target_path)
+
     try:
         yield conn
         conn.commit()
