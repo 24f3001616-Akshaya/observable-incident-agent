@@ -1,0 +1,85 @@
+import sqlite3
+import json
+from typing import Optional, Tuple, Dict, Any
+from config import DB_PATH
+from canonical import canonical, now_iso
+
+def get_connection(path: Optional[str] = None) -> sqlite3.Connection:
+    target_path = path or DB_PATH
+    conn = sqlite3.connect(target_path, timeout=20.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=15000;")
+    return conn
+
+def init_db(path: Optional[str] = None):
+    with get_connection(path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id TEXT PRIMARY KEY,
+                request_hash TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS receipts (
+                run_id TEXT NOT NULL,
+                receipt_id TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, receipt_id)
+            )
+        """)
+
+def get_run(run_id: str, path: Optional[str] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Returns (request_hash, state_dict) or None if not found."""
+    with get_connection(path) as conn:
+        row = conn.execute(
+            "SELECT request_hash, state_json FROM runs WHERE run_id=?",
+            (run_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return row["request_hash"], json.loads(row["state_json"])
+
+def save_run(run_id: str, request_hash: str, state: Dict[str, Any], path: Optional[str] = None):
+    """Inserts a new run record."""
+    timestamp = now_iso()
+    with get_connection(path) as conn:
+        conn.execute(
+            "INSERT INTO runs(run_id, request_hash, state_json, created_at, updated_at) VALUES(?, ?, ?, ?, ?)",
+            (run_id, request_hash, canonical(state), timestamp, timestamp)
+        )
+
+def update_run(run_id: str, state: Dict[str, Any], path: Optional[str] = None):
+    """Updates an existing run record state."""
+    timestamp = now_iso()
+    with get_connection(path) as conn:
+        conn.execute(
+            "UPDATE runs SET state_json=?, updated_at=? WHERE run_id=?",
+            (canonical(state), timestamp, run_id)
+        )
+
+def get_receipt(run_id: str, receipt_id: str, path: Optional[str] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Returns (request_hash, response_dict) or None if not found."""
+    with get_connection(path) as conn:
+        row = conn.execute(
+            "SELECT request_hash, response_json FROM receipts WHERE run_id=? AND receipt_id=?",
+            (run_id, receipt_id)
+        ).fetchone()
+        if not row:
+            return None
+        return row["request_hash"], json.loads(row["response_json"])
+
+def save_receipt(run_id: str, receipt_id: str, request_hash: str, response: Dict[str, Any], path: Optional[str] = None):
+    """Saves a receipt record."""
+    timestamp = now_iso()
+    with get_connection(path) as conn:
+        conn.execute(
+            "INSERT INTO receipts(run_id, receipt_id, request_hash, response_json, created_at) VALUES(?, ?, ?, ?, ?)",
+            (run_id, receipt_id, request_hash, canonical(response), timestamp)
+        )
